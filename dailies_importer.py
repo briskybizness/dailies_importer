@@ -16,13 +16,11 @@ def _normalize_header(name: str) -> str:
     return "".join(ch for ch in str(name) if ch.isprintable()).strip()
 
 
-# Aggressive key normalization for header alias matching
 def _norm_key(name: str) -> str:
     """Aggressive key normalization for header alias matching (case/space/punct-insensitive)."""
     if name is None:
         return ""
     s = str(name).strip().lower()
-    # Keep only alphanumerics so 'colorSpaceOutput', 'Color Space Output', etc. match.
     return "".join(ch for ch in s if ch.isalnum())
 
 
@@ -33,6 +31,86 @@ def _coalesce_first_nonempty(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     block = df[cols].astype(str)
     block = block.replace(r"^\s*$", pd.NA, regex=True)
     return block.bfill(axis=1).iloc[:, 0].fillna("")
+
+
+def _dedupe_join(values: List[str], sep: str = " | ") -> str:
+    """Join unique, non-empty strings preserving first-seen order."""
+    seen = set()
+    out: list[str] = []
+    for v in values:
+        s = str(v).strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return sep.join(out)
+
+
+def _sanitize_template_headers(headers: list[str]) -> list[str]:
+    """
+    Apply user-defined corrections to the template schema.
+
+    Drops mistaken columns:
+      - Source Clip Versions
+      - Date Created
+      - CameraFormat (duplicate)
+      - ISO.1 (duplicate)
+
+    Keeps only one Camera Format and one ISO.
+    """
+    drop = {
+        _normalize_header("Source Clip Versions"),
+        _normalize_header("Date Created"),
+        _normalize_header("CameraFormat"),
+        _normalize_header("ISO.1"),
+    }
+
+    cleaned: list[str] = []
+    for h in headers:
+        nh = _normalize_header(h)
+        if not nh or nh in drop:
+            continue
+        cleaned.append(nh)
+
+    # If only 'CameraFormat' exists, normalize it to 'Camera Format'
+    if _normalize_header("Camera Format") not in cleaned and _normalize_header("CameraFormat") in [
+        _normalize_header(x) for x in headers
+    ]:
+        cleaned = [
+            _normalize_header("Camera Format") if c == _normalize_header("CameraFormat") else c
+            for c in cleaned
+        ]
+
+    # If only 'ISO.1' exists, normalize it back to ISO
+    if _normalize_header("ISO") not in cleaned and _normalize_header("ISO.1") in [
+        _normalize_header(x) for x in headers
+    ]:
+        cleaned = [
+            _normalize_header("ISO") if c == _normalize_header("ISO.1") else c
+            for c in cleaned
+        ]
+
+    return cleaned
+
+
+def _load_template_columns(path: Path, encoding: str = "utf-8") -> list[str]:
+    """Load template CSV headers (ShotGrid import schema) and sanitize them."""
+    try:
+        tpl = pd.read_csv(path, nrows=0, dtype=str, encoding=encoding, keep_default_na=False)
+    except Exception:
+        tpl = pd.read_csv(
+            path,
+            nrows=0,
+            dtype=str,
+            encoding="utf-8",
+            encoding_errors="replace",
+            keep_default_na=False,
+        )
+
+    headers = [str(c) for c in tpl.columns]
+    return _sanitize_template_headers(headers)
 
 
 @dataclass(frozen=True)
@@ -47,7 +125,6 @@ class CombineOptions:
 
 class TabCombineError(Exception):
     pass
-
 
 
 def _read_tsv(path: Path, opts: CombineOptions) -> pd.DataFrame:
@@ -74,19 +151,8 @@ def _read_tsv(path: Path, opts: CombineOptions) -> pd.DataFrame:
     return df
 
 
-# -------- ALE/Avid reader and table dispatcher --------
-
 def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
-    """Read an Avid ALE file into a DataFrame.
-
-    ALE structure is typically:
-      Heading\n...\nColumn\n<tab-separated header line>\nData\n<tab-separated rows>
-
-    This reader:
-      - Parses the Column/Data sections
-      - Applies a small alias map so ALE header variants align with our TSV headers
-      - Optionally inserts SourceFile column
-    """
+    """Read an Avid ALE file into a DataFrame."""
     try:
         raw = path.read_text(encoding=opts.encoding, errors=opts.errors)
     except Exception as e:
@@ -134,10 +200,8 @@ def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
     if data_lines:
         r = csv.reader(data_lines, delimiter=delim)
         for row in r:
-            # Skip completely empty lines
             if not row or all(str(x).strip() == "" for x in row):
                 continue
-            # Pad/truncate to header count
             if len(row) < len(headers):
                 row = row + [""] * (len(headers) - len(row))
             elif len(row) > len(headers):
@@ -146,8 +210,7 @@ def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
 
     df = pd.DataFrame(data_rows, columns=headers)
 
-    # Align common ALE column-name variants to the TSV headers we already use.
-    # Keys are aggressively-normalized so different spacing/case/camelCase still match.
+    # Alias map to align ALE variants to common TSV-style headers.
     alias_to_target = {
         _norm_key("Shoot Day"): "Shoot day",
         _norm_key("ShootDate"): "Shoot Date",
@@ -191,8 +254,6 @@ def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
         _norm_key("Camroll"): "Camroll",
     }
 
-    # Build target groups in original column order so we can coalesce duplicates deterministically.
-    # IMPORTANT: For some fields we prefer a specific ALE source header when multiple map to the same target.
     preferred_source_key_by_target = {
         "FPS": _norm_key("Framerate"),
         "Camera": _norm_key("Camera"),
@@ -211,7 +272,6 @@ def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
             target_order.append(target)
         target_to_sources[target].append(c)
 
-    # Create a new dataframe with unique column names.
     out = pd.DataFrame(index=df.index)
     for target in target_order:
         sources = target_to_sources.get(target, [])
@@ -219,7 +279,6 @@ def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
             out[target] = df[sources[0]] if sources else ""
             continue
 
-        # Reorder sources so preferred header wins when present.
         pref_key = preferred_source_key_by_target.get(target)
         if pref_key:
             preferred = [s for s in sources if _norm_key(s) == pref_key]
@@ -231,8 +290,6 @@ def _read_ale(path: Path, opts: CombineOptions) -> pd.DataFrame:
         out[target] = _coalesce_first_nonempty(df, sources_ordered)
 
     df = out
-
-    # Normalize columns after coalescing
     df.columns = [_normalize_header(c) for c in df.columns]
 
     if opts.add_source_column:
@@ -250,7 +307,6 @@ def _looks_like_ale(path: Path) -> bool:
         head = path.read_bytes()[:256]
     except Exception:
         return False
-    # ALE files typically begin with 'Heading' followed by CRLF.
     return head.lstrip().startswith(b"Heading")
 
 
@@ -299,80 +355,114 @@ def combine_tab_files(
     return combined
 
 
-def select_columns(df: pd.DataFrame, ordered_columns: List[str], strict: bool = False) -> pd.DataFrame:
-    if not ordered_columns:
-        return df
+def _build_output_from_sources(source_df: pd.DataFrame, output_columns: list[str]) -> pd.DataFrame:
+    """
+    Reduce/transform the combined source dataframe to the ShotGrid schema.
 
-    df = df.copy()
+    Rules:
+      - Source Clip Name == Tape (unique identifier)
+      - Slate output comes from Scene
+      - Take Number output comes from Take
+      - Take Name output comes from Name
+      - Detected fields copied verbatim
+      - Comments combined/deduped if multiple exist
+      - Missing values left blank
+      - Rows deduped by Tape / Source Clip Name
+    """
+    df = source_df.copy()
     df.columns = [_normalize_header(c) for c in df.columns]
 
-    norm_to_actual = {_normalize_header(c): c for c in df.columns}
-    wanted_norm = [_normalize_header(c) for c in ordered_columns]
+    key_to_cols: dict[str, list[str]] = {}
+    for c in df.columns:
+        key_to_cols.setdefault(_norm_key(c), []).append(c)
 
-    missing = [ordered_columns[i] for i, n in enumerate(wanted_norm) if n not in norm_to_actual]
-    if missing and strict:
-        raise TabCombineError(f"Missing expected column(s): {', '.join(missing)}")
+    def _pick(*aliases: str) -> list[str]:
+        cols: list[str] = []
+        for a in aliases:
+            cols.extend(key_to_cols.get(_norm_key(a), []))
+        return cols
 
-    keep_actual = [norm_to_actual[n] for n in wanted_norm if n in norm_to_actual]
-    return df.loc[:, keep_actual]
+    out = pd.DataFrame(index=df.index)
 
+    # Derived per user requirements
+    tape_cols = _pick("Tape")
+    out[_normalize_header("Tape")] = _coalesce_first_nonempty(df, tape_cols)
+    out[_normalize_header("Source Clip Name")] = out[_normalize_header("Tape")]
 
-BASE_DESIRED_COLUMNS = [
-    "Tape",
-    "Name",
-    "Scene",
-    "Take",
-    "Camera",
-    "Start",
-    "End",
-    "Duration",
-    "Frames",
-    "Camroll",
-    "FPS",
-    "Shoot Date",
-    "Shoot day",
-    "Image Size",
-    "Resolution",
-    "ASC_SOP",
-    "Color space note",
-    "Input color spac",
-    "colorspaceoutput",
-    "Camera model",
-    "Grade info",
-    "Detected seconda",
-    "Detected dynamic",
-]
+    scene_cols = _pick("Scene")
+    take_cols = _pick("Take")
+    name_cols = _pick("Name")
 
-BASE_DEFAULT_OUTPUT_HEADERS = [
-    "Dailies Name",
-    "Clip Name",
-    "Scene",
-    "Take",
-    "Camera",
-    "Start Timecode",
-    "End Timecode",
-    "Duration",
-    "Frames",
-    "Camroll",
-    "FPS",
-    "Shoot Date",
-    "Shoot Day",
-    "Dailies Resolution",
-    "Camera Resolution",
-    "ASC_SOP",
-    "Camera Color Space",
-    "Input Color Space",
-    "Output Color Space",
-    "Camera Model",
-    "Grade Info",
-    "Secondary Color",
-    "Dynamic Color",
-]
+    out[_normalize_header("Slate")] = _coalesce_first_nonempty(df, scene_cols)
+    out[_normalize_header("Take Number")] = _coalesce_first_nonempty(df, take_cols)
+    out[_normalize_header("Take Name")] = _coalesce_first_nonempty(df, name_cols)
+
+    copy_map: dict[str, tuple[str, ...]] = {
+        "ASC_SAT": ("ASC_SAT", "ASC SAT"),
+        "ASC_SOP": ("ASC_SOP", "ASC SOP"),
+        "Camera Format": ("Camera Format", "Format", "CameraFormat"),
+        "Camera Letter": ("Camera Letter", "Camera"),
+        "Camera Roll Angle": ("Camera Roll Angle", "CameraRollAngle"),
+        "Shutter Angle": ("Shutter Angle", "ShutterAngle"),
+        "Camera Tilt Angle": ("Camera Tilt Angle", "CameraTiltAngle"),
+        "Camera Model": ("Camera Model", "Camera model", "CameraModel", "Uniquecameramode"),
+        "ColorTemp": ("ColorTemp", "Color Temp", "Color Temperature"),
+        "ISO": ("ISO", "ISO.1"),
+        "Resolution": ("Resolution",),
+        "FPS": ("FPS", "Framerate", "Frame Rate"),
+        "Shoot Date": ("Shoot Date", "ShootDate"),
+        "Detected": ("Detected",),
+        "Detected Secondaries": ("Detected Secondaries", "Detected seconda", "Detected Seconda"),
+        "Detected Dynamics": ("Detected Dynamics", "Detected dynamic", "Detected Dynamic"),
+        "Grade Info": ("Grade Info", "Grade info", "GradeInfo"),
+    }
+
+    # Comments: combine + dedupe if multiple comment-like columns exist
+    comment_cols = _pick("Comments", "Comment", "Notes", "Note")
+    if comment_cols:
+        out[_normalize_header("Comments")] = df[comment_cols].astype(str).apply(
+            lambda r: _dedupe_join(r.tolist()), axis=1
+        )
+    else:
+        out[_normalize_header("Comments")] = ""
+
+    for target, aliases in copy_map.items():
+        t = _normalize_header(target)
+        if t in out.columns:
+            continue
+        cols = _pick(*aliases)
+        out[t] = _coalesce_first_nonempty(df, cols)
+
+    # Ensure all requested output columns exist
+    for c in output_columns:
+        if c not in out.columns:
+            out[c] = ""
+
+    out = out.loc[:, output_columns]
+
+    # Deduplicate by unique identifier (Source Clip Name == Tape)
+    uid = _normalize_header("Source Clip Name")
+    if uid in out.columns:
+        def _first_nonempty(series: pd.Series) -> str:
+            for v in series.astype(str).tolist():
+                if str(v).strip() != "":
+                    return str(v)
+            return ""
+
+        agg: dict[str, callable] = {}
+        for c in out.columns:
+            if c == _normalize_header("Comments"):
+                agg[c] = lambda s: _dedupe_join(s.astype(str).tolist())
+            else:
+                agg[c] = _first_nonempty
+
+        out = out.groupby(uid, as_index=False, dropna=False).agg(agg)
+
+    return out
 
 
 def run_app() -> None:
     import tempfile
-
     import streamlit as st
 
     st.set_page_config(page_title="Dailies Importer", layout="wide")
@@ -388,12 +478,21 @@ def run_app() -> None:
         accept_multiple_files=True,
     )
 
+    template = st.file_uploader(
+        "Upload ShotGrid template CSV (optional)",
+        type=["csv"],
+        accept_multiple_files=False,
+        help="If provided, the output CSV will match this header order (with known template mistakes auto-corrected).",
+    )
+
     # Cache management: if the upload set changes, clear cached combine results
-    upload_key = tuple(sorted((f.name, f.size) for f in uploaded)) if uploaded else tuple()
+    upload_key = (
+        tuple(sorted((f.name, f.size) for f in uploaded)) if uploaded else tuple(),
+        (template.name, template.size) if template else (None, None),
+    )
     if st.session_state.get("_upload_key") != upload_key:
         st.session_state["_upload_key"] = upload_key
         st.session_state.pop("combined_df_full", None)
-        # removed: st.session_state.pop("available_extra_columns", None)
 
     with st.sidebar:
         st.header("Options")
@@ -406,7 +505,6 @@ def run_app() -> None:
                 disabled=not add_source,
             )
 
-            # Common encodings for dailies/editorial exports
             encoding = st.selectbox(
                 "Encoding",
                 options=["utf-8", "utf-8-sig", "cp1252", "latin-1", "mac_roman"],
@@ -419,39 +517,13 @@ def run_app() -> None:
                 index=0,
             )
 
-        # Defaults stored in session state so changes only take effect when applied
-        st.session_state.setdefault("selected_extra_columns", [])
         st.session_state.setdefault("preview_rows", 50)
         st.session_state.setdefault("output_name", "combined.csv")
 
         st.subheader("Output")
         st.caption("These settings apply only after you click Apply.")
 
-        # If we already combined, offer additional columns from the uploaded files
-        combined_df_full_cached = st.session_state.get("combined_df_full")
-        if combined_df_full_cached is not None:
-            source_col_norm_for_options = _normalize_header(
-                (st.session_state.get("_source_col_last") or "SourceFile")
-            )
-            base_set = set(BASE_DESIRED_COLUMNS)
-            extras_all = [
-                c
-                for c in combined_df_full_cached.columns
-                if c not in base_set and c != source_col_norm_for_options
-            ]
-            extras_all = sorted(extras_all)
-        else:
-            extras_all = []
-
         with st.form("output_settings_form", clear_on_submit=False):
-            selected_extras_ui = st.multiselect(
-                "Additional columns",
-                options=extras_all,
-                default=st.session_state.get("selected_extra_columns", []),
-                help="Optional: append extra columns from your tab files to the output.",
-                disabled=len(extras_all) == 0,
-            )
-
             preview_rows_ui = st.slider(
                 "Preview rows",
                 10,
@@ -468,11 +540,9 @@ def run_app() -> None:
             applied = st.form_submit_button("Apply output settings")
 
         if applied:
-            st.session_state["selected_extra_columns"] = selected_extras_ui
             st.session_state["preview_rows"] = int(preview_rows_ui)
             st.session_state["output_name"] = str(output_name_ui).strip() or "combined.csv"
 
-        # Use the currently applied values below
         preview_rows = int(st.session_state.get("preview_rows", 50))
         output_name = str(st.session_state.get("output_name", "combined.csv"))
 
@@ -481,8 +551,8 @@ def run_app() -> None:
         st.write(
             "- Files are read as **tab-delimited** (TSV) or **ALE**.\n"
             "- Values are treated as **text** (safe for IDs/timecode).\n"
-            "- Blank columns are dropped.\n"
-            "- Output includes only the core columns listed in the code."
+            "- Output is reduced to the **ShotGrid schema** (template CSV if provided).\n"
+            "- Rows are **deduplicated by Tape** (Source Clip Name == Tape)."
         )
 
     def _combine_uploaded_files() -> pd.DataFrame:
@@ -495,8 +565,6 @@ def run_app() -> None:
             add_source_column=add_source,
             source_column_name=source_col.strip() or "SourceFile",
         )
-        # Persist last-used source column name for sidebar option building
-        st.session_state["_source_col_last"] = source_col.strip() or "SourceFile"
 
         with tempfile.TemporaryDirectory(prefix="tabcombiner_") as tmpdir:
             tmp_paths: list[str] = []
@@ -505,10 +573,46 @@ def run_app() -> None:
                 p.write_bytes(f.getbuffer())
                 tmp_paths.append(str(p))
 
-            return combine_tab_files(tmp_paths, opts=opts)
+            combined_sources = combine_tab_files(tmp_paths, opts=opts)
+
+            # Output schema from template if provided
+            if template is not None:
+                tpl_path = Path(tmpdir) / template.name
+                tpl_path.write_bytes(template.getbuffer())
+                output_columns = _load_template_columns(tpl_path, encoding=encoding.strip() or "utf-8")
+            else:
+                output_columns = [
+                    "Source Clip Name",
+                    "Tape",
+                    "ASC_SAT",
+                    "ASC_SOP",
+                    "Camera Format",
+                    "Camera Letter",
+                    "Camera Roll Angle",
+                    "Shutter Angle",
+                    "Camera Tilt Angle",
+                    "Camera Model",
+                    "ColorTemp",
+                    "ISO",
+                    "Resolution",
+                    "FPS",
+                    "Comments",
+                    "Slate",
+                    "Take Name",
+                    "Take Number",
+                    "Shoot Date",
+                    "Detected",
+                    "Detected Secondaries",
+                    "Detected Dynamics",
+                    "Grade Info",
+                ]
+                output_columns = [_normalize_header(c) for c in output_columns]
+
+            output_df = _build_output_from_sources(combined_sources, output_columns)
+            return output_df
 
     if not uploaded:
-        st.info("Upload two or more .txt/.tab/.tsv files to get started.")
+        st.info("Upload one or more .txt/.tab/.tsv files (and optionally a template CSV) to get started.")
         return
 
     col_a, col_b, col_c = st.columns([1, 1, 2], vertical_alignment="center")
@@ -522,7 +626,6 @@ def run_app() -> None:
             names += f" … (+{len(uploaded) - 6} more)"
         st.write(names)
 
-    # Auto-combine once when uploads exist so extras populate
     if do_combine or (st.session_state.get("combined_df_full") is None):
         try:
             with st.spinner("Combining…"):
@@ -540,65 +643,8 @@ def run_app() -> None:
     if combined_df_full_cached is None:
         return
 
-    source_col_norm = _normalize_header(source_col.strip() or "SourceFile")
-    desired_columns = BASE_DESIRED_COLUMNS.copy()
+    download_df = combined_df_full_cached
 
-    # Append any extra columns the user selected (if present in the combined data)
-    selected_extras = st.session_state.get("selected_extra_columns", [])
-    for c in selected_extras:
-        if c and c not in desired_columns:
-            desired_columns.append(c)
-
-    if add_source:
-        desired_columns = [source_col_norm] + desired_columns
-
-    combined_df = select_columns(combined_df_full_cached, desired_columns, strict=False)
-
-    st.subheader("Download headers")
-    st.caption("Edit the output header names below. This only affects the downloaded CSV — the preview keeps original headers.")
-
-    # Build default header map for the *base* columns
-    base_header_map = {BASE_DESIRED_COLUMNS[i]: BASE_DEFAULT_OUTPUT_HEADERS[i] for i in range(len(BASE_DESIRED_COLUMNS))}
-
-    # Initialize a persistent header map in session state (per original column name)
-    if "output_header_map" not in st.session_state:
-        st.session_state["output_header_map"] = {}
-
-    # Ensure SourceFile has a default output header
-    if add_source:
-        st.session_state["output_header_map"].setdefault(source_col_norm, "Source File")
-
-    # Seed defaults for base columns
-    for k, v in base_header_map.items():
-        st.session_state["output_header_map"].setdefault(k, v)
-
-    # Seed defaults for any extra columns (default to original column name)
-    for c in desired_columns:
-        st.session_state["output_header_map"].setdefault(c, c)
-
-    # Single-row editor: original headers are the (non-editable) column names
-    editor_df = pd.DataFrame(
-        [[st.session_state["output_header_map"].get(c, c) for c in desired_columns]],
-        index=["Output header"],
-        columns=desired_columns,
-    )
-
-    edited = st.data_editor(
-        editor_df,
-        width="stretch",
-    )
-
-    # Persist output header edits into the map
-    for col in desired_columns:
-        st.session_state["output_header_map"][col] = str(edited.loc["Output header", col])
-
-    # Build rename map for download
-    rename_map = {
-        col: _normalize_header(st.session_state["output_header_map"].get(col, col))
-        for col in desired_columns
-    }
-
-    download_df = combined_df.rename(columns=rename_map)
     csv_bytes = download_df.to_csv(sep=",", index=False).encode(encoding.strip() or "utf-8")
     st.download_button(
         label="Download combined CSV",
@@ -608,10 +654,10 @@ def run_app() -> None:
     )
 
     st.subheader("Preview")
-    st.dataframe(combined_df.head(preview_rows), width="stretch")
+    st.dataframe(download_df.head(preview_rows), width="stretch")
 
     st.subheader("Stats")
-    st.write(f"Rows: **{len(combined_df):,}** | Columns: **{len(combined_df.columns):,}**")
+    st.write(f"Rows: **{len(download_df):,}** | Columns: **{len(download_df.columns):,}**")
 
 
 if __name__ == "__main__":
