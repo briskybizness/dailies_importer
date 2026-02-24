@@ -355,7 +355,14 @@ def combine_tab_files(
     return combined
 
 
-def _build_output_from_sources(source_df: pd.DataFrame, output_columns: list[str]) -> pd.DataFrame:
+def _build_output_from_sources(
+    source_df: pd.DataFrame,
+    output_columns: list[str],
+    *,
+    format_shoot_day: bool = True,
+    shoot_day_separator: str = "_",
+    shoot_day_drop_leading_zeros: bool = True,
+) -> pd.DataFrame:
     """
     Reduce/transform the combined source dataframe to the ShotGrid schema.
 
@@ -400,7 +407,15 @@ def _build_output_from_sources(source_df: pd.DataFrame, output_columns: list[str
     copy_map: dict[str, tuple[str, ...]] = {
         "ASC_SAT": ("ASC_SAT", "ASC SAT"),
         "ASC_SOP": ("ASC_SOP", "ASC SOP"),
-        "Camera Format": ("Camera Format", "Format", "CameraFormat"),
+        "Camera Format": (
+            "Input Color Space",
+            "Input color spac",
+            "colorspaceinput",
+            "ColorSpaceInput",
+            "Camera Format",
+            "Format",
+            "CameraFormat",
+        ),
         "Camera Letter": ("Camera Letter", "Camera"),
         "Camera Roll Angle": ("Camera Roll Angle", "CameraRollAngle"),
         "Shutter Angle": ("Shutter Angle", "ShutterAngle"),
@@ -411,7 +426,8 @@ def _build_output_from_sources(source_df: pd.DataFrame, output_columns: list[str
         "Resolution": ("Resolution",),
         "FPS": ("FPS", "Framerate", "Frame Rate"),
         "Shoot Date": ("Shoot Date", "ShootDate"),
-        "Detected": ("Detected",),
+        "Shoot Day": ("Shoot Day", "Shoot day", "ShootDay"),
+        # "Detected": ("Detected",),  # Removed as per instructions
         "Detected Secondaries": ("Detected Secondaries", "Detected seconda", "Detected Seconda"),
         "Detected Dynamics": ("Detected Dynamics", "Detected dynamic", "Detected Dynamic"),
         "Grade Info": ("Grade Info", "Grade info", "GradeInfo"),
@@ -433,6 +449,35 @@ def _build_output_from_sources(source_df: pd.DataFrame, output_columns: list[str
         cols = _pick(*aliases)
         out[t] = _coalesce_first_nonempty(df, cols)
 
+    # Shoot Day formatting (e.g. MU015 -> MU_15)
+    sd_col = _normalize_header("Shoot Day")
+    if format_shoot_day and sd_col in out.columns:
+        import re
+
+        sep = (shoot_day_separator or "_").strip() or "_"
+
+        def _fmt_sd(v: object) -> str:
+            s = str(v).strip()
+            if not s:
+                return ""
+
+            # Already in desired format? keep it
+            if sep in s and re.match(r"^[A-Za-z]+" + re.escape(sep) + r"\d+$", s):
+                return s
+
+            m = re.match(r"^([A-Za-z]+)\s*[_-]?\s*(\d+)$", s)
+            if not m:
+                return s
+
+            prefix, num = m.group(1), m.group(2)
+            if shoot_day_drop_leading_zeros:
+                try:
+                    num = str(int(num))
+                except Exception:
+                    num = num.lstrip("0") or "0"
+            return f"{prefix}{sep}{num}"
+
+        out[sd_col] = out[sd_col].astype(str).map(_fmt_sd)
     # Ensure all requested output columns exist
     for c in output_columns:
         if c not in out.columns:
@@ -516,6 +561,58 @@ def run_app() -> None:
                 ["strict", "replace", "ignore"],
                 index=0,
             )
+
+            st.divider()
+            st.subheader("Shoot Day")
+
+            format_shoot_day = st.checkbox(
+                "Reformat Shoot Day to ShotGrid style",
+                value=True,
+                help="Example: MU015 → MU_15",
+            )
+
+            shoot_day_separator = st.text_input(
+                "Separator",
+                value="_",
+                help="Character placed between the prefix and number (usually _).",
+                disabled=not format_shoot_day,
+            )
+
+            shoot_day_drop_leading_zeros = st.checkbox(
+                "Drop leading zeros",
+                value=True,
+                help="Example: MU015 → MU_15 (not MU_015)",
+                disabled=not format_shoot_day,
+            )
+
+            sd_example = st.text_input(
+                "Preview",
+                value="MU015",
+                help="Type a source Shoot Day value to preview the transformation.",
+                disabled=not format_shoot_day,
+            )
+
+            def _preview_sd(s: str) -> str:
+                import re
+
+                sep = (shoot_day_separator or "_").strip() or "_"
+                s = str(s).strip()
+                if not s:
+                    return ""
+                if sep in s and re.match(r"^[A-Za-z]+" + re.escape(sep) + r"\d+$", s):
+                    return s
+                m = re.match(r"^([A-Za-z]+)\s*[_-]?\s*(\d+)$", s)
+                if not m:
+                    return s
+                prefix, num = m.group(1), m.group(2)
+                if shoot_day_drop_leading_zeros:
+                    try:
+                        num = str(int(num))
+                    except Exception:
+                        num = num.lstrip("0") or "0"
+                return f"{prefix}{sep}{num}"
+
+            st.caption(f"Preview result: **{_preview_sd(sd_example)}**")
 
         st.session_state.setdefault("preview_rows", 50)
         st.session_state.setdefault("output_name", "combined.csv")
@@ -601,14 +698,21 @@ def run_app() -> None:
                     "Take Name",
                     "Take Number",
                     "Shoot Date",
-                    "Detected",
+                    "Shoot Day",
+                    # "Detected",  # Removed as per instructions
                     "Detected Secondaries",
                     "Detected Dynamics",
                     "Grade Info",
                 ]
                 output_columns = [_normalize_header(c) for c in output_columns]
 
-            output_df = _build_output_from_sources(combined_sources, output_columns)
+            output_df = _build_output_from_sources(
+                combined_sources,
+                output_columns,
+                format_shoot_day=format_shoot_day,
+                shoot_day_separator=shoot_day_separator,
+                shoot_day_drop_leading_zeros=shoot_day_drop_leading_zeros,
+            )
             return output_df
 
     if not uploaded:
