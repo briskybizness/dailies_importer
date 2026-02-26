@@ -8,6 +8,8 @@ Key behaviors (as requested):
 - Camera Format is sourced ONLY from Input Color Space (no fallback to Format).
 - Shoot Day is normalized to PREFIX_<2-digit day> by default (configurable width).
 - Shoot Date is normalized to mm/dd/yyyy (handles yyyymmdd like 20251003).
+- Adds a Take column derived from Clip Name using the same logic as Conformer.
+- Take naming UI matches Conformer app screenshot: dropdowns + preview + test clip name.
 """
 
 from __future__ import annotations
@@ -16,8 +18,7 @@ import io
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import pandas as pd
 import streamlit as st
@@ -45,22 +46,179 @@ def _norm_key(s: str) -> str:
     return s
 
 
+# -----------------------------
+# Take parsing (borrowed from Conformer.py) + Conformer-UI-style builder
+# -----------------------------
+
+# Keep a sensible default parser pattern (named groups) for internal use
+DEFAULT_TAKE_PARSER_PATTERN = r"(?P<slate>V?[0-9A-Z]+)-(?P<take>\d+)(?P<cam>[A-Z]+)?(?P<star>\*)?"
+
+
+def _compile_take_parser_regex(pattern: str) -> re.Pattern:
+    """Compile the user-provided take PARSER regex."""
+    pat = (pattern or "").strip() or DEFAULT_TAKE_PARSER_PATTERN
+    return re.compile(pat, re.IGNORECASE)
+
+
+# Default parser regex
+EDITORIAL_TAKE_RE = _compile_take_parser_regex(DEFAULT_TAKE_PARSER_PATTERN)
+
+# -----------------------------
+# Conformer-app-style take naming UI helpers
+# -----------------------------
+
+TAKE_DIGITS_OPTIONS: dict[str, str] = {
+    "1+ digits": r"\d+",
+    "1 digit": r"\d{1}",
+    "2 digits": r"\d{2}",
+    "3 digits": r"\d{3}",
+}
+
+DELIMITER_OPTIONS: dict[str, str] = {
+    "-": "-",
+    "_": "_",
+    "None": "",
+}
+
+CAMERA_TOKEN_OPTIONS: dict[str, str] = {
+    "None": "none",
+    "Optional A-Z": "optional",
+    "Required A-Z": "required",
+}
+
+CAMERA_POSITION_OPTIONS = ["After take", "Before take"]
+
+
+def _build_take_regex_from_ui(
+    *,
+    take_digits_label: str,
+    slate_take_delim_label: str,
+    camera_token_label: str,
+    camera_position_label: str,
+    camera_take_delim_label: str,
+) -> tuple[re.Pattern, str]:
+    """Build a Conformer-style take regex and an example token for preview.
+
+    The generated regex ALWAYS includes named groups (?P<slate>) and (?P<take>),
+    and includes (?P<cam>) when camera is enabled.
+
+    Returns: (compiled_regex, example_take_token)
+    """
+    take_pat = TAKE_DIGITS_OPTIONS.get(take_digits_label, r"\d+")
+    st_delim_raw = DELIMITER_OPTIONS.get(slate_take_delim_label, "-")
+    st_delim = re.escape(st_delim_raw)
+
+    cam_mode = CAMERA_TOKEN_OPTIONS.get(camera_token_label, "optional")
+    cam_delim_raw = DELIMITER_OPTIONS.get(camera_take_delim_label, "")
+    cam_delim = re.escape(cam_delim_raw)
+
+    slate_pat = r"(?P<slate>V?[0-9A-Z]+)"
+    take_group = rf"(?P<take>{take_pat})"
+
+    cam_group = ""
+    cam_example = ""
+    if cam_mode == "required":
+        cam_group = r"(?P<cam>[A-Z])"
+        cam_example = "B"
+    elif cam_mode == "optional":
+        cam_group = r"(?P<cam>[A-Z])?"
+        cam_example = "B"
+
+    # Optional star marker (ignored by conversion)
+    star_group = r"(?P<star>\*)?"
+
+    if cam_mode == "none":
+        # {slate}{delim}{take}
+        core = rf"{slate_pat}{st_delim}{take_group}{star_group}"
+        example = "99E" + st_delim_raw + "12"
+        return re.compile(core, re.IGNORECASE), example
+
+    if camera_position_label == "Before take":
+        # {slate}{delim}{cam}{cam_delim}{take}
+        core = rf"{slate_pat}{st_delim}{cam_group}{cam_delim}{take_group}{star_group}"
+        example = "99E" + st_delim_raw + cam_example + cam_delim_raw + "12"
+        return re.compile(core, re.IGNORECASE), example
+
+    # After take: {slate}{delim}{take}{cam_delim}{cam}
+    core = rf"{slate_pat}{st_delim}{take_group}{cam_delim}{cam_group}{star_group}"
+    example = "99E" + st_delim_raw + "12" + cam_delim_raw + cam_example
+    return re.compile(core, re.IGNORECASE), example
+
+
+def editorial_take_to_vfx_take(
+    editorial_clip_name: str,
+    source_file: str = "",
+    match_re: Optional[re.Pattern] = None,
+    parser_re: Optional[re.Pattern] = None,
+) -> Optional[str]:
+    """Convert editorial take naming to VFX take naming.
+
+    Editorial: {slate}-{take}{cam}
+    VFX:       {slate}_{cam}-{take:02d}
+
+    Returns None if no match.
+
+    Notes:
+    - MATCH regex determines whether a clip name contains a take at all.
+    - PARSER regex extracts named groups: slate, take, optional cam, optional star.
+    - Strip pickup markers (PU) from slate/cam tokens.
+    - Ignore '*' markers.
+    - If cam is missing, infer from `source_file` first character when it's a letter.
+      (In this app we pass Camera Letter as `source_file` for this inference.)
+    """
+    s = (editorial_clip_name or "").strip()
+    mrx = match_re or re.compile(r"V?[0-9A-Z]+-\d+[A-Z]*\*?", re.IGNORECASE)
+    prx = parser_re or EDITORIAL_TAKE_RE
+
+    if not mrx.search(s):
+        return None
+
+    m = prx.search(s)
+    if not m:
+        return None
+
+    gd = m.groupdict()
+    slate = (gd.get("slate") or "").strip().replace("*", "")
+
+    # Strip PU while preserving a leading V.
+    up = slate.upper()
+    if up.startswith("VPU") and len(slate) > 3:
+        slate = "V" + slate[3:]
+    else:
+        if up.startswith("PU") and len(slate) > 2:
+            slate = slate[2:]
+        if slate.upper().endswith("PU") and len(slate) > 2:
+            slate = slate[:-2]
+
+    take_raw = (gd.get("take") or "").strip().replace("*", "")
+    cam = (gd.get("cam") or "").strip().replace("*", "")
+
+    take_raw = re.sub(r"\D", "", take_raw)
+
+    if cam.upper().startswith("PU"):
+        cam = cam[2:].strip()
+
+    if not cam:
+        sf = (source_file or "").strip()
+        if sf:
+            first = sf[0].upper()
+            if "A" <= first <= "Z":
+                cam = first
+
+    try:
+        take_num = int(take_raw)
+    except ValueError:
+        return None
+
+    take_padded = f"{take_num:02d}"
+
+    if cam:
+        return f"{slate}_{cam}-{take_padded}"
+    return f"{slate}_-{take_padded}"
 
 
 def _fmt_shoot_day(value: object, *, sep: str = "_", width: int = 2) -> str:
-    """Normalize shoot day strings.
-
-    Examples (width=2):
-      MU030   -> MU_30
-      MU_030  -> MU_30
-      2U001   -> 2U_01
-      2U014   -> 2U_14
-
-    Rule: extract PREFIX and trailing digits; output PREFIX<sep><digits> where digits are:
-    - right-truncated to width if longer than width
-    - zero-padded to width if shorter than width
-    """
-
+    """Normalize shoot day strings."""
     s = str(value).strip()
     if not s:
         return ""
@@ -88,19 +246,11 @@ def _fmt_shoot_day(value: object, *, sep: str = "_", width: int = 2) -> str:
 
 
 def _fmt_shoot_date(value: object) -> str:
-    """Force Shoot Date to mm/dd/yyyy.
-
-    Handles:
-      - yyyymmdd (20251003)
-      - yyyy-mm-dd / yyyy/mm/dd
-      - mm/dd/yyyy (normalizes zero padding)
-    """
-
+    """Force Shoot Date to mm/dd/yyyy."""
     s = str(value).strip()
     if not s:
         return ""
 
-    # yyyymmdd
     if re.fullmatch(r"\d{8}", s):
         try:
             dt = datetime.strptime(s, "%Y%m%d")
@@ -108,7 +258,6 @@ def _fmt_shoot_date(value: object) -> str:
         except Exception:
             return s
 
-    # yyyy-mm-dd or yyyy/mm/dd
     if re.fullmatch(r"\d{4}[-/]\d{2}[-/]\d{2}", s):
         try:
             dt = datetime.strptime(s.replace("/", "-"), "%Y-%m-%d")
@@ -116,7 +265,6 @@ def _fmt_shoot_date(value: object) -> str:
         except Exception:
             return s
 
-    # mm/dd/yyyy (already)
     if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", s):
         try:
             dt = datetime.strptime(s, "%m/%d/%Y")
@@ -150,7 +298,6 @@ def _read_tsv(uploaded_file, *, opts: ReadOptions) -> pd.DataFrame:
     df = df.fillna("")
     df = df.replace({"nan": "", "NaN": "", "NAN": ""})
 
-    # Stamp SourceFile (always)
     src = _normalize_header(opts.source_column_name or "SourceFile")
     if src in df.columns:
         df[src] = uploaded_file.name
@@ -161,22 +308,10 @@ def _read_tsv(uploaded_file, *, opts: ReadOptions) -> pd.DataFrame:
 
 
 def _read_ale(uploaded_file, *, opts: ReadOptions) -> pd.DataFrame:
-    """Very small ALE reader.
-
-    ALE structure (common):
-      - Header lines
-      - 'Column' line
-      - next line: tab-separated headers
-      - 'Data' line
-      - subsequent lines: tab-separated rows
-
-    This parser is tolerant: it searches for 'Column' and 'Data' markers.
-    """
-
+    """Very small ALE reader."""
     text = _read_text_bytes(uploaded_file, opts=opts)
     lines = [ln.rstrip("\n") for ln in text.splitlines()]
 
-    # Find markers
     col_idx = None
     data_idx = None
     for i, ln in enumerate(lines):
@@ -191,18 +326,14 @@ def _read_ale(uploaded_file, *, opts: ReadOptions) -> pd.DataFrame:
 
     headers = lines[col_idx + 1].split("\t")
     rows = []
-    for ln in lines[data_idx + 1 :]:
+    for ln in lines[data_idx + 1:]:
         if not ln.strip():
             continue
         rows.append(ln.split("\t"))
 
-    df = pd.DataFrame(rows, columns=headers)
-    df = df.fillna("")
-    df = df.astype(str)
-    # Guard against literal 'nan' strings that can appear from upstream
+    df = pd.DataFrame(rows, columns=headers).fillna("").astype(str)
     df = df.replace({"nan": "", "NaN": "", "NAN": ""})
 
-    # Stamp SourceFile (always)
     src = _normalize_header(opts.source_column_name or "SourceFile")
     if src in df.columns:
         df[src] = uploaded_file.name
@@ -216,7 +347,6 @@ def _read_any(uploaded_file, *, opts: ReadOptions) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".ale"):
         return _read_ale(uploaded_file, opts=opts)
-    # treat everything else as tab-delimited text
     return _read_tsv(uploaded_file, opts=opts)
 
 
@@ -224,7 +354,6 @@ def _read_any(uploaded_file, *, opts: ReadOptions) -> pd.DataFrame:
 # Output building
 # -----------------------------
 
-# Target -> list of possible incoming headers
 COPY_MAP: dict[str, tuple[str, ...]] = {
     "SourceFile": ("SourceFile",),
     "Tape": ("Tape", "Reel", "Reel Name", "Tape Name", "tape", "reel"),
@@ -232,14 +361,7 @@ COPY_MAP: dict[str, tuple[str, ...]] = {
     "ASC_SOP": ("ASC_SOP", "ASC SOP"),
     # Camera Format ONLY from Input Color Space (no fallbacks)
     "Camera Format": ("Input Color Space", "Input color spac", "colorspaceinput", "ColorSpaceInput"),
-    "Camera Letter": (
-        "Camera Letter",
-        "Camera",
-        "CameraLetter",
-        "Cam",
-        "Cam Letter",
-        "CamLetter",
-    ),
+    "Camera Letter": ("Camera Letter", "Camera", "CameraLetter", "Cam", "Cam Letter", "CamLetter"),
     "Camera Roll Angle": ("Camera Roll Angle", "CameraRollAngle"),
     "Shutter Angle": ("Shutter Angle", "ShutterAngle"),
     "Camera Tilt Angle": ("Camera Tilt Angle", "CameraTiltAngle"),
@@ -252,25 +374,8 @@ COPY_MAP: dict[str, tuple[str, ...]] = {
         "Camera Type",
         "CameraType",
     ),
-    "ColorTemp": (
-        "ColorTemp",
-        "Color Temp",
-        "Color Temperature",
-        "Kelvin",
-        "White Balance",
-        "WhiteBalance",
-        "WB",
-    ),
-    "ISO": (
-        "ISO",
-        "ISO.1",
-        "EI",
-        "Exposure Index",
-        "ExposureIndex",
-        "ASA",
-        "ISOSpeed",
-        "ISO Speed",
-    ),
+    "ColorTemp": ("ColorTemp", "Color Temp", "Color Temperature", "Kelvin", "White Balance", "WhiteBalance", "WB"),
+    "ISO": ("ISO", "ISO.1", "EI", "Exposure Index", "ExposureIndex", "ASA", "ISOSpeed", "ISO Speed"),
     "Camera Resolution": ("Resolution", "Camera Resolution", "CameraResolution"),
     "FPS": ("FPS", "Framerate", "Frame Rate"),
     "Comments": ("Comments", "Comment"),
@@ -279,12 +384,10 @@ COPY_MAP: dict[str, tuple[str, ...]] = {
     "Take Number": ("Take Number", "TakeNumber", "Take"),
     "Shoot Date": ("Shoot Date", "ShootDate"),
     "Shoot Day": ("Shoot Day", "Shoot day", "ShootDay"),
-    # Removed "Detected" on purpose; keep these if present
     "Detected Secondaries": ("Detected Secondaries", "Detected seconda", "Detected Seconda"),
     "Detected Dynamics": ("Detected Dynamics", "Detected dynamic", "Detected Dynamic"),
     "Grade Info": ("Grade Info", "Grade info", "GradeInfo"),
 }
-
 
 DEFAULT_OUTPUT_COLUMNS: list[str] = [
     "SourceFile",
@@ -304,6 +407,7 @@ DEFAULT_OUTPUT_COLUMNS: list[str] = [
     "Comments",
     "Slate",
     "Clip Name",
+    "Take",
     "Take Number",
     "Shoot Date",
     "Shoot Day",
@@ -326,13 +430,14 @@ def _dedupe_join(values: Iterable[str]) -> str:
         out.append(vv)
     return "; ".join(out)
 
+
 def _coalesce_first_nonempty(df: pd.DataFrame, cols: list[str]) -> pd.Series:
-    """Return a Series with the first non-empty value across cols (left-to-right)."""
     if not cols:
         return pd.Series([""] * len(df), index=df.index)
     block = df[cols].astype(str)
     block = block.replace(r"^\s*$", pd.NA, regex=True)
     return block.bfill(axis=1).iloc[:, 0].fillna("")
+
 
 def _build_output(
     combined_sources: pd.DataFrame,
@@ -340,22 +445,19 @@ def _build_output(
     output_columns: list[str],
     shoot_day_separator: str = "_",
     shoot_day_number_width: int = 2,
+    take_match_regex: Optional[re.Pattern] = None,
+    take_parser_regex: Optional[re.Pattern] = None,
 ) -> pd.DataFrame:
-    """Build final output dataframe in the requested schema."""
-
-    # Normalize incoming columns for matching
     src_df = combined_sources.copy()
     src_df.columns = [_normalize_header(c) for c in src_df.columns]
     src_df = src_df.fillna("")
     src_df = src_df.replace({"nan": "", "NaN": "", "NAN": ""})
 
-    # Build a lookup from normalized key -> list of matching actual column names (preserve order)
     key_to_cols: dict[str, list[str]] = {}
     for c in src_df.columns:
         key_to_cols.setdefault(_norm_key(c), []).append(c)
 
     def pick_cols(*aliases: str) -> list[str]:
-        """Return all matching columns for the alias list, in alias order, preserving source order."""
         picked: list[str] = []
         seen: set[str] = set()
         for a in aliases:
@@ -369,13 +471,11 @@ def _build_output(
 
     out = pd.DataFrame(index=src_df.index)
 
-    # Always ensure SourceFile exists in source and is first in output schema
     out_cols = [_normalize_header(c) for c in output_columns]
     src_col = _normalize_header("SourceFile")
     out_cols = [c for c in out_cols if c != src_col]
     out_cols.insert(0, src_col)
 
-    # Comments: combine + dedupe if multiple comment-like columns exist
     comments_key = _normalize_header("Comments")
     if comments_key in out_cols:
         comment_cols = pick_cols("Comments", "Comment", "Notes", "Note")
@@ -385,7 +485,6 @@ def _build_output(
         else:
             out[comments_key] = ""
 
-    # Populate requested columns (coalesce across all matching candidates)
     for target in out_cols:
         if target == comments_key:
             continue
@@ -396,10 +495,6 @@ def _build_output(
         else:
             out[target] = _coalesce_first_nonempty(src_df, cols).replace({"nan": "", "NaN": "", "NAN": ""})
 
-    # Legacy conform rules (from previous version):
-    # - Slate defaults to Scene
-    # - Take Name defaults to Name
-    # - Take Number defaults to Take
     slate_col = _normalize_header("Slate")
     clip_name_col = _normalize_header("Clip Name")
     take_num_col = _normalize_header("Take Number")
@@ -407,7 +502,6 @@ def _build_output(
     def _blank(s: pd.Series) -> pd.Series:
         return s.astype(str).str.strip().eq("")
 
-    # If Slate came through as blank, try Scene from the source df
     if slate_col in out.columns:
         scene_cols = pick_cols("Scene")
         if scene_cols:
@@ -426,29 +520,42 @@ def _build_output(
             mask = _blank(out[take_num_col])
             out.loc[mask, take_num_col] = _coalesce_first_nonempty(src_df.loc[mask], take_cols)
 
-    # Clean any newly introduced 'nan' strings
+    take_col = _normalize_header("Take")
+    if take_col in out.columns:
+        cam_letter_col = _normalize_header("Camera Letter")
+
+        clip_series = out.get(clip_name_col, pd.Series([""] * len(out), index=out.index)).astype(str)
+        if cam_letter_col in out.columns:
+            cam_series = out[cam_letter_col].astype(str)
+        else:
+            cam_series = pd.Series([""] * len(out), index=out.index)
+
+        out[take_col] = [
+            editorial_take_to_vfx_take(
+                cn,
+                (cl or ""),
+                match_re=take_match_regex,
+                parser_re=take_parser_regex,
+            ) or ""
+            for cn, cl in zip(clip_series.tolist(), cam_series.tolist())
+        ]
+
     out = out.replace({"nan": "", "NaN": "", "NAN": ""})
 
-    # Shoot Day formatting
     sd_col = _normalize_header("Shoot Day")
     if sd_col in out.columns:
         out[sd_col] = out[sd_col].map(lambda v: _fmt_shoot_day(v, sep=shoot_day_separator, width=shoot_day_number_width))
 
-    # Shoot Date formatting
     sdate_col = _normalize_header("Shoot Date")
     if sdate_col in out.columns:
         out[sdate_col] = out[sdate_col].map(_fmt_shoot_date)
 
-    # Reorder
     out = out.loc[:, out_cols]
-
     return out
 
 
 def _load_template_columns(uploaded_template) -> list[str]:
-    """Load headers from a template CSV (first row only)."""
     raw = uploaded_template.getvalue()
-    # Try utf-8-sig first (common for Excel)
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             text = raw.decode(enc)
@@ -470,12 +577,13 @@ def run_app() -> None:
     st.title("Dailies Importer")
 
     with st.sidebar:
-        # Allow clearing the file uploader by changing its key
         if "uploaded_files_key" not in st.session_state:
             st.session_state["uploaded_files_key"] = 0
+
         st.header("Inputs")
         if st.button("Clear uploaded files"):
             st.session_state["uploaded_files_key"] += 1
+
         uploaded_files = st.file_uploader(
             "Upload ALE and/or TAB-delimited TXT files",
             type=["ale", "txt", "tab", "tsv", "csv"],
@@ -492,13 +600,87 @@ def run_app() -> None:
         )
 
         st.header("Options")
-        encoding = st.selectbox(
-            "Encoding",
-            options=["utf-8", "utf-8-sig", "cp1252", "latin-1", "mac_roman"],
-            index=0,
-        )
-        errors = st.selectbox("Encoding errors", options=["strict", "replace", "ignore"], index=0)
+        with st.expander("File decoding", expanded=False):
+            encoding = st.selectbox(
+                "Encoding",
+                options=["utf-8", "utf-8-sig", "cp1252", "latin-1", "mac_roman"],
+                index=0,
+            )
+            errors = st.selectbox("Encoding errors", options=["strict", "replace", "ignore"], index=0)
 
+        # --- Take naming (match Conformer app UI screenshot)
+        st.subheader("Take naming")
+
+        take_digits_label = st.selectbox(
+            "Take digits",
+            options=list(TAKE_DIGITS_OPTIONS.keys()),
+            index=0,  # 1+ digits
+        )
+
+        slate_take_delim_label = st.selectbox(
+            "Take/slate delimiter",
+            options=list(DELIMITER_OPTIONS.keys()),
+            index=0,  # '-'
+        )
+
+        camera_token_label = st.selectbox(
+            "Camera token",
+            options=list(CAMERA_TOKEN_OPTIONS.keys()),
+            index=1,  # Optional A-Z
+        )
+
+        camera_position_label = st.selectbox(
+            "Camera position",
+            options=CAMERA_POSITION_OPTIONS,
+            index=0,  # After take
+        )
+
+        camera_take_delim_label = st.selectbox(
+            "Camera/take delimiter",
+            options=list(DELIMITER_OPTIONS.keys()),
+            index=2,  # None
+        )
+
+        try:
+            take_regex, example_token = _build_take_regex_from_ui(
+                take_digits_label=take_digits_label,
+                slate_take_delim_label=slate_take_delim_label,
+                camera_token_label=camera_token_label,
+                camera_position_label=camera_position_label,
+                camera_take_delim_label=camera_take_delim_label,
+            )
+        except re.error as e:
+            st.error(f"Invalid take naming config: {e}. Falling back to defaults.")
+            take_regex, example_token = _build_take_regex_from_ui(
+                take_digits_label="1+ digits",
+                slate_take_delim_label="-",
+                camera_token_label="Optional A-Z",
+                camera_position_label="After take",
+                camera_take_delim_label="None",
+            )
+
+        st.markdown("### Preview")
+        st.caption("Example take token (format preview — optional '*' is ignored)")
+        st.code(example_token)
+
+        st.caption("Test a clip name")
+        test_clip_name = st.text_input("", value="", placeholder="Paste Clip Name")
+        if test_clip_name.strip():
+            parsed = editorial_take_to_vfx_take(
+                test_clip_name,
+                source_file="",
+                match_re=take_regex,
+                parser_re=take_regex,
+            )
+            if parsed:
+                st.success(parsed)
+            else:
+                st.warning("No take found in clip name.")
+
+        st.session_state["_take_match_regex"] = take_regex
+        st.session_state["_take_parser_regex"] = take_regex
+
+        # --- Shoot day UI
         st.subheader("Shoot Day")
         shoot_day_separator = st.text_input("Separator", value="_")
         shoot_day_number_width = st.number_input(
@@ -516,7 +698,6 @@ def run_app() -> None:
 
     opts = ReadOptions(encoding=encoding.strip() or "utf-8", errors=errors)
 
-    # Read and combine
     frames: list[pd.DataFrame] = []
     read_errors: list[str] = []
 
@@ -537,7 +718,26 @@ def run_app() -> None:
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # Determine output schema
+    # Quick preview of take parsing behavior (first 25 rows)
+    clip_col_guess = None
+    for c in combined.columns:
+        if _norm_key(c) in (_norm_key("Clip Name"), _norm_key("Take Name"), _norm_key("Name")):
+            clip_col_guess = c
+            break
+
+    take_match_regex = st.session_state.get("_take_match_regex")
+    take_parser_regex = st.session_state.get("_take_parser_regex")
+
+    if clip_col_guess and take_match_regex and take_parser_regex:
+        with st.expander("Preview: Take parsing on first 25 rows"):
+            sample = combined[[clip_col_guess]].head(25).copy()
+            sample["Matches?"] = sample[clip_col_guess].astype(str).apply(lambda s: bool(take_match_regex.search((s or "").strip())))
+            sample["Parsed Take"] = sample[clip_col_guess].astype(str).apply(
+                lambda s: editorial_take_to_vfx_take((s or ""), "", match_re=take_match_regex, parser_re=take_parser_regex) or ""
+            )
+            sample.rename(columns={clip_col_guess: "Clip Name"}, inplace=True)
+            st.dataframe(sample, use_container_width=True)
+
     if template is not None:
         try:
             output_columns = _load_template_columns(template)
@@ -547,13 +747,24 @@ def run_app() -> None:
     else:
         output_columns = DEFAULT_OUTPUT_COLUMNS.copy()
 
-    # Always include these critical identifiers even when a template is used
-    must_have = ["SourceFile"]
+    must_have = ["SourceFile", "Take"]
     norm_cols = [_normalize_header(c) for c in output_columns]
+
     for c in must_have:
         cc = _normalize_header(c)
-        if cc not in norm_cols:
+        if cc in norm_cols:
+            continue
+
+        if cc == _normalize_header("Take"):
+            clip_key = _normalize_header("Clip Name")
+            if clip_key in norm_cols:
+                idx = norm_cols.index(clip_key) + 1
+                norm_cols.insert(idx, cc)
+            else:
+                norm_cols.append(cc)
+        else:
             norm_cols.insert(0, cc)
+
     output_columns = norm_cols
 
     output_df = _build_output(
@@ -561,20 +772,18 @@ def run_app() -> None:
         output_columns=output_columns,
         shoot_day_separator=shoot_day_separator,
         shoot_day_number_width=int(shoot_day_number_width),
+        take_match_regex=take_match_regex,
+        take_parser_regex=take_parser_regex,
     )
 
-    # Warn on duplicate Tape names (we do NOT remove/merge rows)
     tape_col = _normalize_header("Tape")
     if tape_col in output_df.columns:
         tape_series = output_df[tape_col].astype(str).str.strip()
-
-        # consider non-empty only
         nonempty = tape_series.ne("")
         dup_mask = nonempty & tape_series.duplicated(keep=False)
         dup_rows = int(dup_mask.sum())
 
         if dup_rows > 0:
-            # number of distinct duplicate tape values
             dup_groups = int(tape_series[dup_mask].drop_duplicates().shape[0])
             st.warning(
                 f"⚠️ Duplicate Tape names detected: **{dup_rows}** rows across **{dup_groups}** duplicate Tape values. "
@@ -582,7 +791,6 @@ def run_app() -> None:
             )
 
             with st.expander("Show duplicate Tape examples"):
-                # Show counts per Tape
                 counts = (
                     tape_series[dup_mask]
                     .value_counts()
@@ -599,6 +807,7 @@ def run_app() -> None:
                     for c in [
                         tape_col,
                         _normalize_header("Clip Name"),
+                        _normalize_header("Take"),
                         _normalize_header("Take Number"),
                         _normalize_header("Shoot Date"),
                         _normalize_header("Shoot Day"),
@@ -617,7 +826,6 @@ def run_app() -> None:
     st.subheader("Preview")
     st.dataframe(output_df, use_container_width=True, height=420)
 
-    # Export
     csv_bytes = output_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Download combined CSV",
