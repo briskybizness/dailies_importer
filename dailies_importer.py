@@ -10,6 +10,8 @@ Key behaviors (as requested):
 - Shoot Date is normalized to mm/dd/yyyy (handles yyyymmdd like 20251003).
 - Adds a Take column derived from Clip Name using the same logic as Conformer.
 - Take naming UI matches Conformer app screenshot: dropdowns + preview + test clip name.
+- Adds a UI field to strip unwanted substrings from the extracted Slate/Camera tokens
+  before generating the VFX Take (e.g. remove PU, SER, etc.).
 """
 
 from __future__ import annotations
@@ -46,6 +48,28 @@ def _norm_key(s: str) -> str:
     return s
 
 
+def _dedupe_join(values: Iterable[str]) -> str:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        vv = str(v).strip()
+        if not vv:
+            continue
+        if vv in seen:
+            continue
+        seen.add(vv)
+        out.append(vv)
+    return "; ".join(out)
+
+
+def _coalesce_first_nonempty(df: pd.DataFrame, cols: list[str]) -> pd.Series:
+    if not cols:
+        return pd.Series([""] * len(df), index=df.index)
+    block = df[cols].astype(str)
+    block = block.replace(r"^\s*$", pd.NA, regex=True)
+    return block.bfill(axis=1).iloc[:, 0].fillna("")
+
+
 # -----------------------------
 # Take parsing (borrowed from Conformer.py) + Conformer-UI-style builder
 # -----------------------------
@@ -62,6 +86,7 @@ def _compile_take_parser_regex(pattern: str) -> re.Pattern:
 
 # Default parser regex
 EDITORIAL_TAKE_RE = _compile_take_parser_regex(DEFAULT_TAKE_PARSER_PATTERN)
+
 
 # -----------------------------
 # Conformer-app-style take naming UI helpers
@@ -117,11 +142,18 @@ def _build_take_regex_from_ui(
 
     cam_group = ""
     cam_example = ""
+
+    # IMPORTANT: the overall regex is compiled with IGNORECASE so that slates match
+    # regardless of case, but the camera token must be STRICTLY uppercase to avoid
+    # picking up pickup suffixes like 'PUa' where 'a' is not a camera letter.
+    # `(?-i:...)` disables IGNORECASE for the camera subpattern.
+    cam_letter_pat = r"(?-i:[A-Z])"
+
     if cam_mode == "required":
-        cam_group = r"(?P<cam>[A-Z])"
+        cam_group = rf"(?P<cam>{cam_letter_pat})"
         cam_example = "B"
     elif cam_mode == "optional":
-        cam_group = r"(?P<cam>[A-Z])?"
+        cam_group = rf"(?P<cam>{cam_letter_pat})?"
         cam_example = "B"
 
     # Optional star marker (ignored by conversion)
@@ -145,11 +177,68 @@ def _build_take_regex_from_ui(
     return re.compile(core, re.IGNORECASE), example
 
 
+# -----------------------------
+# Strip-token helpers (UI-driven)
+# -----------------------------
+
+def _parse_strip_tokens(raw: str) -> list[str]:
+    """Parse a user-entered token list (comma/space/line separated)."""
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    # Allow commas, semicolons, whitespace, and newlines as separators.
+    parts = re.split(r"[;,\n\r\t ]+", s)
+    tokens = [p.strip() for p in parts if p and p.strip()]
+
+    # Dedupe case-insensitively while preserving original casing (first occurrence).
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tokens:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def _strip_tokens(text: str, tokens: list[str], *, preserve_leading_v: bool = True) -> str:
+    """Remove literal token substrings from `text` (case-insensitive)."""
+    if not text:
+        return ""
+    if not tokens:
+        return str(text)
+
+    s = str(text)
+
+    prefix = ""
+    rest = s
+    if preserve_leading_v and rest[:1].upper() == "V":
+        prefix = rest[:1]
+        rest = rest[1:]
+
+    for tok in tokens:
+        t = (tok or "").strip()
+        if not t:
+            continue
+        rest = re.sub(re.escape(t), "", rest, flags=re.IGNORECASE)
+
+    # Clean up any doubled delimiters/underscores created by stripping.
+    rest = re.sub(r"__+", "_", rest)
+    rest = re.sub(r"--+", "-", rest)
+    rest = rest.strip(" _-")
+
+    return prefix + rest
+
+
 def editorial_take_to_vfx_take(
     editorial_clip_name: str,
     source_file: str = "",
     match_re: Optional[re.Pattern] = None,
     parser_re: Optional[re.Pattern] = None,
+    strip_tokens: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Convert editorial take naming to VFX take naming.
 
@@ -157,43 +246,50 @@ def editorial_take_to_vfx_take(
     VFX:       {slate}_{cam}-{take:02d}
 
     Returns None if no match.
-
-    Notes:
-    - MATCH regex determines whether a clip name contains a take at all.
-    - PARSER regex extracts named groups: slate, take, optional cam, optional star.
-    - Strip pickup markers (PU) from slate/cam tokens.
-    - Ignore '*' markers.
-    - If cam is missing, infer from `source_file` first character when it's a letter.
-      (In this app we pass Camera Letter as `source_file` for this inference.)
     """
     s = (editorial_clip_name or "").strip()
+    tokens = strip_tokens or []
+
+    # Apply token stripping to the full clip-name string BEFORE parsing.
+    # This prevents patterns like 'PU' from being interpreted as the camera token.
+    parse_s = s
+    for tok in tokens:
+        t = (tok or "").strip()
+        if not t:
+            continue
+        parse_s = re.sub(re.escape(t), "", parse_s, flags=re.IGNORECASE)
+
     mrx = match_re or re.compile(r"V?[0-9A-Z]+-\d+[A-Z]*\*?", re.IGNORECASE)
     prx = parser_re or EDITORIAL_TAKE_RE
 
-    if not mrx.search(s):
+    if not mrx.search(parse_s):
         return None
 
-    m = prx.search(s)
+    m = prx.search(parse_s)
     if not m:
         return None
 
     gd = m.groupdict()
     slate = (gd.get("slate") or "").strip().replace("*", "")
-
-    # Strip PU while preserving a leading V.
-    up = slate.upper()
-    if up.startswith("VPU") and len(slate) > 3:
-        slate = "V" + slate[3:]
-    else:
-        if up.startswith("PU") and len(slate) > 2:
-            slate = slate[2:]
-        if slate.upper().endswith("PU") and len(slate) > 2:
-            slate = slate[:-2]
-
     take_raw = (gd.get("take") or "").strip().replace("*", "")
     cam = (gd.get("cam") or "").strip().replace("*", "")
 
+    # Normalize take to digits only
     take_raw = re.sub(r"\D", "", take_raw)
+
+    # Apply user stripping first (so PUa -> a if user wants PU removed)
+    slate = _strip_tokens(slate, tokens, preserve_leading_v=True)
+    cam = _strip_tokens(cam, tokens, preserve_leading_v=False)
+
+    # Legacy PU cleanup (kept for backward compatibility)
+    up_slate = slate.upper()
+    if up_slate.startswith("VPU") and len(slate) > 3:
+        slate = "V" + slate[3:]
+    else:
+        if up_slate.startswith("PU") and len(slate) > 2:
+            slate = slate[2:]
+        if slate.upper().endswith("PU") and len(slate) > 2:
+            slate = slate[:-2]
 
     if cam.upper().startswith("PU"):
         cam = cam[2:].strip()
@@ -417,28 +513,6 @@ DEFAULT_OUTPUT_COLUMNS: list[str] = [
 ]
 
 
-def _dedupe_join(values: Iterable[str]) -> str:
-    seen: set[str] = set()
-    out: list[str] = []
-    for v in values:
-        vv = str(v).strip()
-        if not vv:
-            continue
-        if vv in seen:
-            continue
-        seen.add(vv)
-        out.append(vv)
-    return "; ".join(out)
-
-
-def _coalesce_first_nonempty(df: pd.DataFrame, cols: list[str]) -> pd.Series:
-    if not cols:
-        return pd.Series([""] * len(df), index=df.index)
-    block = df[cols].astype(str)
-    block = block.replace(r"^\s*$", pd.NA, regex=True)
-    return block.bfill(axis=1).iloc[:, 0].fillna("")
-
-
 def _build_output(
     combined_sources: pd.DataFrame,
     *,
@@ -447,6 +521,7 @@ def _build_output(
     shoot_day_number_width: int = 2,
     take_match_regex: Optional[re.Pattern] = None,
     take_parser_regex: Optional[re.Pattern] = None,
+    strip_tokens: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     src_df = combined_sources.copy()
     src_df.columns = [_normalize_header(c) for c in src_df.columns]
@@ -499,8 +574,8 @@ def _build_output(
     clip_name_col = _normalize_header("Clip Name")
     take_num_col = _normalize_header("Take Number")
 
-    def _blank(s: pd.Series) -> pd.Series:
-        return s.astype(str).str.strip().eq("")
+    def _blank(series: pd.Series) -> pd.Series:
+        return series.astype(str).str.strip().eq("")
 
     if slate_col in out.columns:
         scene_cols = pick_cols("Scene")
@@ -530,12 +605,14 @@ def _build_output(
         else:
             cam_series = pd.Series([""] * len(out), index=out.index)
 
+        toks = strip_tokens or []
         out[take_col] = [
             editorial_take_to_vfx_take(
                 cn,
                 (cl or ""),
                 match_re=take_match_regex,
                 parser_re=take_parser_regex,
+                strip_tokens=toks,
             ) or ""
             for cn, cl in zip(clip_series.tolist(), cam_series.tolist())
         ]
@@ -611,6 +688,14 @@ def run_app() -> None:
         # --- Take naming (match Conformer app UI screenshot)
         st.subheader("Take naming")
 
+        st.caption("Optional: remove unwanted substrings from extracted Slate/Camera tokens (comma/space separated).")
+        strip_tokens_raw = st.text_input(
+            "Remove from slate/camera",
+            value="",
+            placeholder="e.g. PU, SER",
+        )
+        strip_tokens = _parse_strip_tokens(strip_tokens_raw)
+
         take_digits_label = st.selectbox(
             "Take digits",
             options=list(TAKE_DIGITS_OPTIONS.keys()),
@@ -671,6 +756,7 @@ def run_app() -> None:
                 source_file="",
                 match_re=take_regex,
                 parser_re=take_regex,
+                strip_tokens=strip_tokens,
             )
             if parsed:
                 st.success(parsed)
@@ -679,6 +765,7 @@ def run_app() -> None:
 
         st.session_state["_take_match_regex"] = take_regex
         st.session_state["_take_parser_regex"] = take_regex
+        st.session_state["_strip_tokens"] = strip_tokens
 
         # --- Shoot day UI
         st.subheader("Shoot Day")
@@ -727,13 +814,20 @@ def run_app() -> None:
 
     take_match_regex = st.session_state.get("_take_match_regex")
     take_parser_regex = st.session_state.get("_take_parser_regex")
+    strip_tokens = st.session_state.get("_strip_tokens") or []
 
     if clip_col_guess and take_match_regex and take_parser_regex:
         with st.expander("Preview: Take parsing on first 25 rows"):
             sample = combined[[clip_col_guess]].head(25).copy()
             sample["Matches?"] = sample[clip_col_guess].astype(str).apply(lambda s: bool(take_match_regex.search((s or "").strip())))
             sample["Parsed Take"] = sample[clip_col_guess].astype(str).apply(
-                lambda s: editorial_take_to_vfx_take((s or ""), "", match_re=take_match_regex, parser_re=take_parser_regex) or ""
+                lambda s: editorial_take_to_vfx_take(
+                    (s or ""),
+                    "",
+                    match_re=take_match_regex,
+                    parser_re=take_parser_regex,
+                    strip_tokens=strip_tokens,
+                ) or ""
             )
             sample.rename(columns={clip_col_guess: "Clip Name"}, inplace=True)
             st.dataframe(sample, use_container_width=True)
@@ -774,6 +868,7 @@ def run_app() -> None:
         shoot_day_number_width=int(shoot_day_number_width),
         take_match_regex=take_match_regex,
         take_parser_regex=take_parser_regex,
+        strip_tokens=strip_tokens,
     )
 
     tape_col = _normalize_header("Tape")
